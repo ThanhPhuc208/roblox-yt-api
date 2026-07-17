@@ -1,201 +1,82 @@
-local ScreenGui = Instance.new("ScreenGui")
-local MainFrame = Instance.new("Frame")
-local UICorner = Instance.new("UICorner")
-local UIStroke = Instance.new("UIStroke")
-local TopBar = Instance.new("Frame")
-local TitleLabel = Instance.new("TextLabel")
-local CloseBtn = Instance.new("TextButton")
+const express = require('express');
+const yts = require('yt-search');
+const ytdl = require('@distube/ytdl-core');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-local ContentFrame = Instance.new("Frame")
-local SearchBar = Instance.new("TextBox")
-local SearchBtn = Instance.new("TextButton")
-local StatusLabel = Instance.new("TextLabel")
+app.get('/api/search', async (req, res) => {
+    const searchQuery = req.query.q;
+    if (!searchQuery) {
+        return res.status(400).json({ error: "Missing search query." });
+    }
 
-local ControlsFrame = Instance.new("Frame")
-local PlayPauseBtn = Instance.new("TextButton")
-local LoopBtn = Instance.new("TextButton")
-local VolumeUpBtn = Instance.new("TextButton")
-local VolumeDownBtn = Instance.new("TextButton")
+    try {
+        console.log(`Searching for: ${searchQuery}`);
+        const searchResults = await yts(searchQuery);
+        const video = searchResults.videos[0]; // Lấy kết quả video chính xác đầu tiên
 
-local AudioSource = Instance.new("Sound", game:GetService("Workspace"))
-local IsPlaying = false
-local IsLooped = false
+        if (!video) {
+            return res.status(404).json({ error: "No videos found." });
+        }
 
--- Cong ket noi API dong bo tu may chu render luong (Thay bang url render cua ban)
-local PUBLIC_API_SERVER = "https://onrender.com" 
+        console.log(`Found: ${video.title} - Generating proxy stream endpoint.`);
+        
+        // Tạo đường dẫn trung chuyển dữ liệu trực tiếp chạy qua máy chủ của bạn
+        // Cơ chế này giúp Roblox kết nối an toàn mà không bị YouTube quét IP thiết bị
+        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        const proxyStreamUrl = `${hostUrl}/api/play?url=${encodeURIComponent(video.url)}`;
 
-ScreenGui.Parent = game:GetService("CoreGui") or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
-ScreenGui.ResetOnSpawn = false
+        res.json({
+            title: video.title,
+            streamUrl: proxyStreamUrl
+        });
 
-MainFrame.Name = "YTB_Music_V1_Real"
-MainFrame.Parent = ScreenGui
-MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-MainFrame.Position = UDim2.new(0.5, -200, 0.5, -130)
-MainFrame.Size = UDim2.new(0, 400, 0, 260)
-MainFrame.Active = true
-MainFrame.Draggable = true
+    } catch (err) {
+        console.log(`Search error: ${err.message}`);
+        res.status(500).json({ error: err.message });
+    }
+});
 
-UICorner.CornerRadius = UDim.new(0, 8)
-UICorner.Parent = MainFrame
-UIStroke.Color = Color3.fromRGB(230, 33, 23)
-UIStroke.Thickness = 2
-UIStroke.Parent = MainFrame
+// Cụm xử lý Proxy truyền âm thanh liên tục (Chunk Stream) chống lỗi chặn luồng (403)
+app.get('/api/play', async (req, res) => {
+    const videoUrl = req.query.url;
+    if (!videoUrl) {
+        return res.status(400).send("Missing video URL.");
+    }
 
-TopBar.Size = UDim2.new(1, 0, 0, 35)
-TopBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-TopBar.Parent = MainFrame
-Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 8)
+    try {
+        // Thiết lập cấu hình User-Agent giả lập trình duyệt để YouTube không chặn dữ liệu
+        const stream = ytdl(videoUrl, {
+            quality: 'highestaudio',
+            filter: 'audioonly',
+            highWaterMark: 1 << 25,
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+            }
+        });
 
-TitleLabel.Size = UDim2.new(1, -50, 1, 0)
-TitleLabel.Position = UDim2.new(0, 15, 0, 0)
-TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "YouTube Music Player V1.0 (Active Stream)"
-TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-TitleLabel.TextSize = 13
-TitleLabel.Font = Enum.Font.SourceSansBold
-TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TitleLabel.Parent = TopBar
+        // Thiết lập Header phản hồi chuẩn định dạng âm thanh dòng chảy (Audio Stream) cho Roblox đọc
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Transfer-Encoding', 'chunked');
 
-CloseBtn.Size = UDim2.new(0, 30, 0, 25)
-CloseBtn.Position = UDim2.new(1, -35, 0, 5)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(230, 33, 23)
-CloseBtn.Text = "X"
-CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-CloseBtn.TextSize = 12
-CloseBtn.Font = Enum.Font.SourceSansBold
-CloseBtn.Parent = TopBar
-Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+        // Truyền dữ liệu âm thanh thô liên tục (Pipe stream) trực tiếp về game
+        stream.pipe(res);
 
-ContentFrame.Size = UDim2.new(1, -20, 1, -110)
-ContentFrame.Position = UDim2.new(0, 10, 0, 45)
-ContentFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
-ContentFrame.Parent = MainFrame
-Instance.new("UICorner", ContentFrame).CornerRadius = UDim.new(0, 6)
+        stream.on('error', (err) => {
+            console.log(`Stream pipeline error: ${err.message}`);
+            if (!res.headersSent) {
+                res.status(500).send(err.message);
+            }
+        });
 
-SearchBar.Size = UDim2.new(0.75, -5, 0, 35)
-SearchBar.Position = UDim2.new(0, 10, 0, 10)
-SearchBar.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-SearchBar.Text = ""
-SearchBar.PlaceholderText = "Search song name or paste YouTube URL..."
-SearchBar.TextColor3 = Color3.fromRGB(255, 255, 255)
-SearchBar.TextSize = 12
-SearchBar.Font = Enum.Font.SourceSans
-SearchBar.Parent = ContentFrame
-Instance.new("UICorner", SearchBar).CornerRadius = UDim.new(0, 4)
+    } catch (err) {
+        console.log(`Playback error: ${err.message}`);
+        res.status(500).send(err.message);
+    }
+});
 
-SearchBtn.Size = UDim2.new(0.25, -15, 0, 35)
-SearchBtn.Position = UDim2.new(0.75, 5, 0, 10)
-SearchBtn.BackgroundColor3 = Color3.fromRGB(230, 33, 23)
-SearchBtn.Text = "SEARCH"
-SearchBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-SearchBtn.TextSize = 12
-SearchBtn.Font = Enum.Font.SourceSansBold
-SearchBtn.Parent = ContentFrame
-Instance.new("UICorner", SearchBtn).CornerRadius = UDim.new(0, 4)
-
-StatusLabel.Size = UDim2.new(1, -20, 0, 50)
-StatusLabel.Position = UDim2.new(0, 10, 0, 55)
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Text = "System Status: Ready.\nType a song title above to begin live decoding."
-StatusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-StatusLabel.TextSize = 12
-StatusLabel.TextWrapped = true
-StatusLabel.Font = Enum.Font.SourceSans
-StatusLabel.Parent = ContentFrame
-
-ControlsFrame.Size = UDim2.new(1, -20, 0, 50)
-ControlsFrame.Position = UDim2.new(0, 10, 1, -60)
-ControlsFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-ControlsFrame.Parent = MainFrame
-Instance.new("UICorner", ControlsFrame).CornerRadius = UDim.new(0, 6)
-
-local function createCtrlBtn(text, pos, size)
-    local btn = Instance.new("TextButton")
-    btn.Size = size or UDim2.new(0, 80, 0, 35)
-    btn.Position = pos
-    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-    btn.Text = text
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.TextSize = 12
-    btn.Font = Enum.Font.SourceSansBold
-    btn.Parent = ControlsFrame
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
-    return btn
-end
-
-PlayPauseBtn = createCtrlBtn("PAUSE", UDim2.new(0, 10, 0, 7))
-LoopBtn = createCtrlBtn("LOOP: OFF", UDim2.new(0, 100, 0, 7))
-VolumeDownBtn = createCtrlBtn("VOL -", UDim2.new(1, -140, 0, 7), UDim2.new(0, 60, 0, 35))
-VolumeUpBtn = createCtrlBtn("VOL +", UDim2.new(1, -70, 0, 7), UDim2.new(0, 60, 0, 35))
-
-local function executeStreamFetch(query)
-    StatusLabel.Text = "Status: Connecting to API endpoint..."
-    local targetUrl = PUBLIC_API_SERVER .. "/api/search?q=" .. game:GetService("HttpService"):UrlEncode(query)
-    
-    local success, response = pcall(function()
-        return game:HttpGet(targetUrl)
-    end)
-    
-    if success and response then
-        local data = game:GetService("HttpService"):JSONDecode(response)
-        if data and data.streamUrl then
-            StatusLabel.Text = "Now Playing: " .. (data.title or query)
-            AudioSource.SoundId = data.streamUrl
-            AudioSource:Play()
-            IsPlaying = true
-            PlayPauseBtn.Text = "PAUSE"
-        else
-            StatusLabel.Text = "API Error: Stream URL could not be resolved for this track."
-        end
-    else
-        StatusLabel.Text = "Network Error: Failed to reach the active API stream server."
-    end
-end
-
-SearchBtn.MouseButton1Click:Connect(function()
-    if SearchBar.Text ~= "" then
-        executeStreamFetch(SearchBar.Text)
-    end
-end)
-
-PlayPauseBtn.MouseButton1Click:Connect(function()
-    if AudioSource.SoundId ~= "" then
-        if IsPlaying then
-            AudioSource:Pause()
-            IsPlaying = false
-            PlayPauseBtn.Text = "PLAY"
-            StatusLabel.Text = "Status: Audio paused."
-        else
-            AudioSource:Resume()
-            IsPlaying = true
-            PlayPauseBtn.Text = "PAUSE"
-            StatusLabel.Text = "Status: Resumed audio playback."
-        end
-    end
-end)
-
-LoopBtn.MouseButton1Click:Connect(function()
-    IsLooped = not IsLooped
-    AudioSource.Looped = IsLooped
-    if IsLooped then
-        LoopBtn.Text = "LOOP: ON"
-        LoopBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 0)
-    else
-        LoopBtn.Text = "LOOP: OFF"
-        LoopBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-    end
-end)
-
-VolumeUpBtn.MouseButton1Click:Connect(function()
-    AudioSource.Volume = math.min(AudioSource.Volume + 0.1, 3)
-end)
-
-VolumeDownBtn.MouseButton1Click:Connect(function()
-    AudioSource.Volume = math.max(AudioSource.Volume - 0.1, 0)
-end)
-
-CloseBtn.MouseButton1Click:Connect(function()
-    AudioSource:Stop()
-    ScreenGui:Destroy()
-end)
-
+app.listen(PORT, () => {
+    console.log(`Production API Server is actively listening on port ${PORT}`);
+});
